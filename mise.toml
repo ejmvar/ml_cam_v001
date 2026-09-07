@@ -1,0 +1,96 @@
+[tools]
+python = "latest"
+uv = "latest"
+cmake = "3.30"
+ninja = "1.12"
+ccache = "latest"
+usage = "latest"
+shellcheck = "latest"
+
+
+[env]
+# 1. ESP-IDF Base Configuration
+#IDF_PATH = "~/esp/esp-idf"
+IDF_CCACHE_ENABLE = "1"
+
+# to obtain ESPRESSIF environment
+# env -i bash -c '. ~/.espressif/v6.0.2/esp-idf/export.sh && env' | grep -E '^(IDF_|PATH|VIRTUAL_ENV)' > ~/.espressif/v6.0.2/idf_env.txt
+# env -i bash -c '. ~/.espressif/v6.0.2/esp-idf/export.sh && env' | grep -E '^(IDF_|PATH|VIRTUAL_ENV)' > ~/.espressif/v6.0.2/idf_env.txt
+# 20260812-110913
+# ❯ . ~/.espressif/v6.0.2/esp-idf/export.sh ; env | grep -E '^(IDF_|PATH|VIRTUAL_ENV)' > idf_env.txt
+# 20260812-111203
+# 20260812-112248
+# bash -c 'source ~/.espressif/v6.0.2/esp-idf/export.sh >/dev/null 2>&1 && export -p | grep -E "(IDF_|PATH=|VIRTUAL_ENV=)"' > 00-ideas/idf_fast_export.sh
+# 20260812-112817
+_.source=[
+    # AI API Keys
+    "~/bin/SECRETS/OpenCode.AI/EXPORT_SECRET_OPENCODE_APIKEY.sh",
+    "~/bin/SECRETS/Gemini-Google-Project-20260701/GEMINI_API_KEY.sh",
+    "~/bin/SECRETS/OpenCode.AI/EXPORT_SECRET_OPENCODE_APIKEY.sh",
+    "~/bin/SECRETS/OpenRouter.AI/EXPORT_SECRET_OPENROUTER_APIKEY.sh",
+#    # ESP-IDF Toolchain paths
+#    #"~/.espressif/v6.0.2/esp-idf/export.sh"
+#    #"00-ideas/idf_env.txt"
+    
+    # ESP-IDF is loaded by scripts/idf-env.sh, not by mise.
+    # "~/.espressif/v6.0.2/esp-idf/export.sh"
+    
+]
+
+
+
+# ESPRESSIF-INSTALLER.sh
+
+#[env]
+#[[env]]
+# Path to your ESP-IDF directory (if installed via git or ESP-IDF Installation Manager)
+# IDF_PATH = "{{config_root}}/esp-idf"
+# ------------------------------
+# # 20260812-112612 removed
+# IDF_PYTHON_ENV_PATH="/home/qq/.espressif/python_env/idf6.0_py3.14_env"
+# IDF_PATH="/home/qq/.espressif/v6.0.2/esp-idf"
+# ESP_IDF_VERSION="6.0"
+# IDF_PY_COMP_WORDBREAKS=" "
+# IDF_DEACTIVATE_FILE_PATH="/tmp/tmp_0yuc9ziidf_1686065"
+
+# IDF_TOOLS_EXPORT_CMD="/home/qq/.espressif/v6.0.2/esp-idf/export.sh"
+# IDF_TOOLS_INSTALL_CMD="/home/qq/.espressif/v6.0.2/esp-idf/install.sh"
+# ------------------------------
+
+
+
+
+
+
+[tasks.help]
+description = "Show the repeatable project workflows"
+run = "printf '%s\\n' 'mise run idf-check      Verify ESP-IDF and idf.py' 'mise run test            Run canonical host tests' 'mise run target-build   Build target Unity image' 'mise run target-test    Flash target image and run hardware Unity tests (ESP_PORT=...)' 'mise run firmware-build Build normal firmware' 'mise run allboards-test Discover, flash, capture, and analyze all ACM boards' 'mise run check          Run host tests before target and firmware builds'"
+
+[tasks.test]
+description = "Run canonical host tests"
+run = "./scripts/host-test.sh"
+
+[tasks.idf-check]
+description = "Verify the configured ESP-IDF checkout and idf.py"
+run = "./scripts/idf-check.sh"
+
+[tasks.target-build]
+description = "Build the target Unity image"
+run = "./scripts/target-build.sh"
+
+[tasks.target-test]
+description = "Flash the target image and run hardware Unity tests"
+run = "./scripts/target-test.sh"
+
+[tasks.firmware-build]
+description = "Build the normal firmware"
+run = "./scripts/firmware-build.sh"
+
+[tasks.allboards-test]
+description = "Discover, flash, capture, and analyze all ACM boards"
+run = "./TEST-e2e/allboards/run.sh"
+
+[tasks.check]
+description = "Run host tests before target and firmware builds"
+depends = ["test"]
+run = ["mise run target-build", "mise run firmware-build"]
