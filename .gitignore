@@ -1,0 +1,19 @@
+# ESP-IDF generated output and local configuration
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+
+# Local tooling and code intelligence
+.codegraph/
+.vscode/
+.clangd
+
+# Runtime logs and Python caches
+log/
+__pycache__/
+*.py[cod]
+
+# Sensitive local provisioning material
+*.nvs.csv
+*.nvs.bin
