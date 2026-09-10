@@ -612,10 +612,18 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
                                   output.width, output.height, encode_width, encode_height,
                                   0);
         } else {
+            /*
+             * esp32-camera's RGB565 encoder defaults to big-endian byte input,
+             * while this host uint16_t buffer is little-endian in memory.
+             * The camera mutex serializes every camera/encoder operation, so
+             * changing this process-global setting is safe for this call.
+             */
+            jpgSetRgb565BE(false);
             bool encoded = fmt2jpg_cb((uint8_t *)pixels, encode_bytes,
                                       (uint16_t)encode_width, (uint16_t)encode_height,
                                       PIXFORMAT_RGB565, options->quality,
                                       jpeg_output_callback, &jpeg_output);
+            jpgSetRgb565BE(true);
             if (!encoded || jpeg_output.overflow ||
                 !valid_jpeg(jpeg_output.buffer, jpeg_output.written) ||
                 jpeg_output.written > MAX_OUTPUT_JPEG) {

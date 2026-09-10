@@ -192,6 +192,15 @@ path because it unconditionally allocates a 128 KiB JPEG buffer. This bounded
 callback path is a target-specific memory safeguard, not a portability claim
 for every esp32-camera release or hardware configuration.
 
+The installed esp32-camera RGB565 encoder defaults to big-endian byte input
+(`jpgSetRgb565BE(true)`), while the transformed `uint16_t` pixel buffer is
+stored in little-endian host memory. The transform path temporarily sets
+`jpgSetRgb565BE(false)` around each `fmt2jpg_cb()` call and restores the
+default immediately afterward. The camera mutex is held for the complete
+transform, so this process-global encoder setting cannot race another camera
+operation. This changes byte order only; grayscale and reduced-color numeric
+semantics remain unchanged.
+
 ### Dedicated ML-mode endpoint rules
 
 The dedicated URLs in the endpoint table bind the mode on the server, which
