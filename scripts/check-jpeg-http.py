@@ -12,9 +12,11 @@ SOF_MARKERS = {
 
 def jpeg_dimensions(image: bytes) -> tuple[int, int]:
     if len(image) > MAX_BODY:
-        raise ValueError(f"body exceeds {MAX_BODY}-byte bound")
-    if len(image) < 4 or image[:2] != b"\xff\xd8" or image[-2:] != b"\xff\xd9":
-        raise ValueError("missing JPEG start/end markers")
+        raise ValueError(f"body exceeds {MAX_BODY}-byte bound (truncated by validator)")
+    if len(image) < 2 or image[:2] != b"\xff\xd8":
+        raise ValueError("invalid JPEG bytes: missing start marker")
+    if len(image) < 4 or image[-2:] != b"\xff\xd9":
+        raise ValueError("truncated JPEG body: missing end marker")
 
     position = 2
     width = height = None

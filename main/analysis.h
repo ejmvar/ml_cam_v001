@@ -54,6 +54,14 @@ esp_err_t ml_analysis_init(void);
 /** Capture exactly prev, current, and next, replacing the prior window on success. */
 esp_err_t ml_analysis_run(const ml_image_options_t *options, ml_analysis_result_t *result);
 
+/** Queue one bounded analysis request; the worker performs it asynchronously. */
+esp_err_t ml_analysis_request(const ml_image_options_t *options);
+
+/** Return the latest matching result and its state without waiting for analysis. */
+esp_err_t ml_analysis_get_latest(const ml_image_options_t *options,
+                                 ml_analysis_result_t *result, bool *has_result,
+                                 bool *busy, uint32_t *age_ms);
+
 /** Lock the retained window for one bounded inspection/send operation. */
 esp_err_t ml_analysis_lock(void);
 

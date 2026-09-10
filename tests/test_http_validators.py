@@ -71,6 +71,19 @@ def test_jpeg_validator_rejects_malformed_marker_segment():
     assert result.returncode != 0
 
 
+def test_jpeg_validator_distinguishes_invalid_bytes_from_truncation():
+    invalid = run_validator("check-jpeg-http.py", b"not a jpeg")
+    truncated = run_validator("check-jpeg-http.py", b"\xff\xd8\x00")
+    assert b"invalid JPEG bytes" in invalid.stderr
+    assert b"truncated JPEG body" in truncated.stderr
+
+
+def test_wget_status_validator_classifies_http_error():
+    result = run_validator("check-wget-status.py", b"  HTTP/1.1 503 Service Unavailable\n")
+    assert result.returncode == 2
+    assert b"HTTP error response: 503" in result.stderr
+
+
 def test_jpeg_validator_rejects_wrong_dimensions():
     result = run_validator("check-jpeg-http.py", minimal_jpeg(40, 24), "--expected-width", "320", "--expected-height", "240")
     assert result.returncode != 0
@@ -118,6 +131,17 @@ def test_analysis_validator_rejects_quality_mismatch():
     assert result.returncode != 0
 
 
+def test_analysis_validator_accepts_async_response_without_cached_result():
+    document = {
+        "status": "busy",
+        "has_result": False,
+        "mode": "normal",
+        "quality": 15,
+    }
+    result = run_validator("check-analysis-json.py", json.dumps(document).encode())
+    assert result.returncode == 0
+
+
 def test_resolution_and_cache_contract_is_explicit_in_firmware():
     assert '"/capture/qqvga.jpg"' in HTTP_SOURCE
     assert '"/capture/hqvga.jpg"' in HTTP_SOURCE
@@ -131,6 +155,8 @@ def test_resolution_and_cache_contract_is_explicit_in_firmware():
     assert 'resolution_transition_discard' in CAMERA_SOURCE
     assert 'jpeg_dimensions' in CAMERA_SOURCE
     assert 'for (unsigned attempt = 0; attempt < 3; ++attempt)' in CAMERA_SOURCE
+    assert 'sensor_configuration_changed' in CAMERA_SOURCE
+    assert 'active_quality_valid' in CAMERA_SOURCE
 
 
 def test_normal_capture_fallback_contract_is_explicit_in_firmware():
@@ -178,3 +204,22 @@ def test_verified_resolution_set_excludes_higher_sizes():
     assert 'ML_CAMERA_RESOLUTION_QVGA' in CAMERA_SOURCE
     assert 'FRAMESIZE_VGA' not in CAMERA_SOURCE
     assert 'FRAMESIZE_SVGA' not in CAMERA_SOURCE
+
+
+def test_analysis_is_bounded_async_and_returns_cached_state():
+    analysis = (ROOT / "main" / "analysis.c").read_text()
+    assert 'static SemaphoreHandle_t analysis_trigger' in analysis
+    assert 'xTaskCreate(analysis_worker' in analysis
+    assert 'if (analysis_busy)' in analysis
+    assert '"status\\\":\\\"cached' in HTTP_SOURCE
+    assert '"age_ms' in HTTP_SOURCE
+    assert '202 Accepted' in HTTP_SOURCE
+
+
+def test_analysis_cache_requires_matching_mode_quality_and_resolution():
+    analysis = (ROOT / "main" / "analysis.c").read_text()
+    assert 'analysis_options_match(options, &latest_result.options)' in analysis
+    assert 'left->mode == right->mode' in analysis
+    assert 'left->quality == right->quality' in analysis
+    assert 'left->resolution == right->resolution' in analysis
+    assert 'ml_analysis_get_latest(&options' in HTTP_SOURCE

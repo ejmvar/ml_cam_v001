@@ -114,6 +114,28 @@ wget_once() {
         --connect-timeout="$HTTP_TIMEOUT" --timeout="$HTTP_TIMEOUT" -O - "$1"
 }
 
+validate_image_once() {
+    local url="$1" status_file body_status http_status
+    status_file="$(mktemp)"
+    if wget --quiet --no-verbose --server-response --tries=1 \
+        --connect-timeout="$HTTP_TIMEOUT" --timeout="$HTTP_TIMEOUT" -O - "$url" \
+        2>"$status_file" | uv run python scripts/check-jpeg-http.py --expected-width 320 --expected-height 240; then
+        body_status=0
+    else
+        body_status=$?
+    fi
+    if uv run python scripts/check-wget-status.py <"$status_file"; then
+        http_status=0
+    else
+        http_status=$?
+    fi
+    rm -f -- "$status_file"
+    if ((http_status == 2)); then
+        return 2
+    fi
+    return "$body_status"
+}
+
 BASE_URL="http://${DEVICE_IP}"
 printf '[flash-reset-verify] wget /health\n'
 if ! wget_once "${BASE_URL}/health?mode=normal&quality=15" | uv run python scripts/check-health-json.py; then
@@ -121,7 +143,7 @@ if ! wget_once "${BASE_URL}/health?mode=normal&quality=15" | uv run python scrip
 fi
 
 printf '[flash-reset-verify] wget /capture.jpg\n'
-if ! wget_once "${BASE_URL}/capture.jpg?mode=normal&quality=15" | uv run python scripts/check-jpeg-http.py --expected-width 320 --expected-height 240; then
+if ! validate_image_once "${BASE_URL}/capture.jpg?mode=normal&quality=15"; then
     die 'primary failure stage: wget endpoint (/capture.jpg JPEG validation failed).'
 fi
 
@@ -132,7 +154,7 @@ fi
 
 for image in /analysis/prev.jpg /analysis/current.jpg /analysis/next.jpg; do
     printf '[flash-reset-verify] wget %s\n' "$image"
-    if ! wget_once "${BASE_URL}${image}?mode=normal&quality=15" | uv run python scripts/check-jpeg-http.py --expected-width 320 --expected-height 240; then
+    if ! validate_image_once "${BASE_URL}${image}?mode=normal&quality=15"; then
         die "primary failure stage: wget endpoint (${image} JPEG validation failed)."
     fi
 done

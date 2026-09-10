@@ -16,6 +16,12 @@ def main() -> int:
     document = json.loads(body)
     assert document["mode"] == args.mode
     assert document["quality"] == args.quality
+    status = document.get("status")
+    if status in ("queued", "busy"):
+        assert document["has_result"] is False
+        assert set(document) == {"status", "has_result", "mode", "quality"}
+        print(f"analysis JSON passed: {status} (no cached result)")
+        return 0
     decoded = document["decoded_pixels"]
     assert decoded["status"] in ("available", "unavailable")
     assert decoded["format"] == "RGB565"

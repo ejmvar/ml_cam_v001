@@ -25,6 +25,8 @@ static bool camera_initialized;
 static bool camera_warmup_done;
 static bool active_resolution_valid;
 static ml_camera_resolution_t active_resolution;
+static bool active_quality_valid;
+static uint8_t active_quality;
 static SemaphoreHandle_t camera_mutex;
 static const size_t MAX_TRANSFORM_PIXELS = 8192;
 static const size_t MAX_TRANSFORM_RGB_BYTES = MAX_TRANSFORM_PIXELS * sizeof(uint16_t);
@@ -39,6 +41,12 @@ static int periodic_published_slot = -1;
 static SemaphoreHandle_t periodic_mutex;
 static TaskHandle_t periodic_task;
 static bool periodic_started;
+
+static uint32_t camera_elapsed_ms(int64_t started_us)
+{
+    int64_t elapsed_us = esp_timer_get_time() - started_us;
+    return (uint32_t)(elapsed_us > 0 ? elapsed_us / 1000 : 0);
+}
 
 static uint32_t camera_now_ms(void)
 {
@@ -444,6 +452,7 @@ static void log_transform_failure(ml_image_mode_t mode, const char *stage,
 esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
                                  uint8_t **data, size_t *size)
 {
+    int64_t started_us = esp_timer_get_time();
     if (options == NULL || data == NULL || size == NULL ||
         options->mode > ML_IMAGE_MODE_MOTION_EDGES || options->quality < 10 ||
         options->quality > 30 || options->resolution > ML_CAMERA_RESOLUTION_QVGA ||
@@ -468,8 +477,13 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
     sensor_t *sensor = esp_camera_sensor_get();
     framesize_t frame_size = options->resolution == ML_CAMERA_RESOLUTION_QQVGA ? FRAMESIZE_QQVGA :
                              options->resolution == ML_CAMERA_RESOLUTION_HQVGA ? FRAMESIZE_HQVGA : FRAMESIZE_QVGA;
-    if (sensor == NULL || sensor->set_quality(sensor, options->quality) != 0 ||
-        sensor->set_framesize(sensor, frame_size) != 0) {
+    bool sensor_configuration_changed = !active_resolution_valid ||
+                                         active_resolution != options->resolution ||
+                                         !active_quality_valid ||
+                                         active_quality != options->quality;
+    if (sensor == NULL ||
+        (sensor_configuration_changed && sensor->set_quality(sensor, options->quality) != 0) ||
+        (sensor_configuration_changed && sensor->set_framesize(sensor, frame_size) != 0)) {
         xSemaphoreGive(camera_mutex);
         if (options->mode != ML_IMAGE_MODE_NORMAL) {
             log_transform_failure(options->mode, "sensor_configuration", ESP_ERR_INVALID_STATE, 0, 0, 0, 0, 0);
@@ -479,6 +493,8 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
     bool resolution_changed = !active_resolution_valid || active_resolution != options->resolution;
     active_resolution = options->resolution;
     active_resolution_valid = true;
+    active_quality = options->quality;
+    active_quality_valid = true;
     if (resolution_changed) {
         camera_fb_t *discarded = esp_camera_fb_get();
         if (discarded == NULL) {
@@ -570,8 +586,12 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
     decode_config.advanced.working_buffer_size = TRANSFORM_WORK_BYTES;
     esp_jpeg_image_output_t output = {0};
     err = esp_jpeg_decode(&decode_config, &output);
+    ESP_LOGI(TAG, "Analysis transform mode=%s phase=decode duration=%ums",
+             ml_image_mode_name(options->mode),
+             (unsigned)camera_elapsed_ms(started_us));
     /* The decoder's output dimensions are metadata; the bounded byte count is authoritative. */
     if (err == ESP_OK && output.output_len == scaled.bytes) {
+        int64_t transform_started_us = esp_timer_get_time();
         if (options->mode == ML_IMAGE_MODE_GRAYSCALE) {
             for (size_t y = 0; y < encode_height; ++y) {
                 for (size_t x = 0; x < encode_width; ++x) {
@@ -602,6 +622,9 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
                 }
             }
         }
+        ESP_LOGI(TAG, "Analysis transform mode=%s phase=pixel_transform duration=%ums",
+                 ml_image_mode_name(options->mode),
+                 (unsigned)camera_elapsed_ms(transform_started_us));
         jpeg_output_context_t jpeg_output = {
             .buffer = malloc(MAX_OUTPUT_JPEG),
             .capacity = MAX_OUTPUT_JPEG,
@@ -624,6 +647,10 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
                                       PIXFORMAT_RGB565, options->quality,
                                       jpeg_output_callback, &jpeg_output);
             jpgSetRgb565BE(true);
+            ESP_LOGI(TAG, "Analysis transform mode=%s phase=encode duration=%ums output=%u",
+                     ml_image_mode_name(options->mode),
+                     (unsigned)camera_elapsed_ms(started_us),
+                     (unsigned)jpeg_output.written);
             if (!encoded || jpeg_output.overflow ||
                 !valid_jpeg(jpeg_output.buffer, jpeg_output.written) ||
                 jpeg_output.written > MAX_OUTPUT_JPEG) {

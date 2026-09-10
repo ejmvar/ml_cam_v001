@@ -7,10 +7,12 @@
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "jpeg_decoder.h"
 #include "jpeg_bounds.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static const char *TAG = "ml_cam_analysis";
 static const size_t MAX_JPEG_SIZE = 8192;
@@ -33,6 +35,55 @@ typedef struct {
 static retained_frame_t retained[3];
 static SemaphoreHandle_t analysis_mutex;
 static ml_image_options_t retained_options;
+static SemaphoreHandle_t analysis_state_mutex;
+static SemaphoreHandle_t analysis_trigger;
+static ml_analysis_result_t latest_result;
+static ml_image_options_t pending_options;
+static bool latest_available;
+static bool analysis_busy;
+static uint32_t latest_completed_ms;
+
+static uint32_t analysis_now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static bool analysis_options_match(const ml_image_options_t *left,
+                                   const ml_image_options_t *right)
+{
+    return left != NULL && right != NULL && left->mode == right->mode &&
+           left->quality == right->quality && left->resolution == right->resolution;
+}
+
+static void analysis_worker(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        xSemaphoreTake(analysis_trigger, portMAX_DELAY);
+        ml_image_options_t options;
+        if (xSemaphoreTake(analysis_state_mutex, portMAX_DELAY) != pdTRUE) continue;
+        options = pending_options;
+        xSemaphoreGive(analysis_state_mutex);
+
+        ml_analysis_result_t result;
+        esp_err_t err = ml_analysis_run(&options, &result);
+        if (xSemaphoreTake(analysis_state_mutex, portMAX_DELAY) == pdTRUE) {
+            if (err == ESP_OK) {
+                latest_result = result;
+                latest_completed_ms = analysis_now_ms();
+                latest_available = true;
+            }
+            analysis_busy = false;
+            xSemaphoreGive(analysis_state_mutex);
+        }
+    }
+}
+
+static uint32_t analysis_elapsed_ms(int64_t started_us)
+{
+    int64_t elapsed_us = esp_timer_get_time() - started_us;
+    return (uint32_t)(elapsed_us > 0 ? elapsed_us / 1000 : 0);
+}
 
 static uint32_t digest(const uint8_t *data, size_t size)
 {
@@ -58,24 +109,29 @@ static uint32_t changed_bytes(const retained_frame_t *left,
     return changed;
 }
 
-static esp_err_t capture_copy(const ml_image_options_t *options, retained_frame_t *destination)
+static esp_err_t capture_copy(const ml_image_options_t *options, const char *frame_name,
+                              retained_frame_t *destination)
 {
+    int64_t started_us = esp_timer_get_time();
     uint8_t *jpeg = NULL;
     size_t jpeg_size = 0;
     esp_err_t err = ml_camera_capture_jpeg(options, &jpeg, &jpeg_size);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "JPEG capture failed during analysis (%s)", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Analysis capture=%s failed (%s; %ums)", frame_name,
+                 esp_err_to_name(err), (unsigned)analysis_elapsed_ms(started_us));
         return err;
     }
     if (jpeg == NULL || jpeg_size == 0 || jpeg_size > MAX_JPEG_SIZE) {
-        ESP_LOGE(TAG, "JPEG frame exceeds bounded analysis capacity (%u bytes)",
-                 (unsigned)jpeg_size);
+        ESP_LOGE(TAG, "Analysis capture=%s exceeds bound (%u bytes; %ums)", frame_name,
+                 (unsigned)jpeg_size, (unsigned)analysis_elapsed_ms(started_us));
         free(jpeg);
         return ESP_ERR_NO_MEM;
     }
     destination->data = jpeg;
     destination->size = jpeg_size;
     destination->fnv1a32 = digest(destination->data, destination->size);
+    ESP_LOGI(TAG, "Analysis capture=%s complete (%u bytes; %ums)", frame_name,
+             (unsigned)destination->size, (unsigned)analysis_elapsed_ms(started_us));
     return ESP_OK;
 }
 
@@ -88,9 +144,10 @@ static esp_err_t decode_frame(const retained_frame_t *source,
                               const char *frame_name,
                               uint16_t *pixels,
                               uint8_t *working,
-                              decoded_frame_t *decoded,
-                              const char **failure_stage)
+                               decoded_frame_t *decoded,
+                               const char **failure_stage)
 {
+    int64_t started_us = esp_timer_get_time();
     if (source == NULL || frame_name == NULL || pixels == NULL || decoded == NULL ||
         working == NULL || source->data == NULL || source->size == 0 || failure_stage == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -144,12 +201,16 @@ static esp_err_t decode_frame(const retained_frame_t *source,
     decoded->pixels = pixels;
     decoded->width = scaled.width;
     decoded->height = scaled.height;
+    ESP_LOGI(TAG, "Analysis decode=%s complete (%ux%u; %ums)", frame_name,
+             (unsigned)decoded->width, (unsigned)decoded->height,
+             (unsigned)analysis_elapsed_ms(started_us));
     return ESP_OK;
 }
 
 static ml_analysis_decoded_pair_t compare_decoded(const decoded_frame_t *left,
                                                   const decoded_frame_t *right)
 {
+    int64_t started_us = esp_timer_get_time();
     ml_analysis_decoded_pair_t result = {0};
     result.width = left->width < right->width ? left->width : right->width;
     result.height = left->height < right->height ? left->height : right->height;
@@ -165,6 +226,9 @@ static ml_analysis_decoded_pair_t compare_decoded(const decoded_frame_t *left,
     }
     result.change_per_mille = change_per_mille(result.changed_pixels,
                                                result.compared_pixels);
+    ESP_LOGI(TAG, "Analysis compare complete (%ux%u; %ums)",
+             (unsigned)result.width, (unsigned)result.height,
+             (unsigned)analysis_elapsed_ms(started_us));
     return result;
 }
 
@@ -174,7 +238,49 @@ esp_err_t ml_analysis_init(void)
         return ESP_OK;
     }
     analysis_mutex = xSemaphoreCreateMutex();
-    return analysis_mutex == NULL ? ESP_ERR_NO_MEM : ESP_OK;
+    analysis_state_mutex = xSemaphoreCreateMutex();
+    analysis_trigger = xSemaphoreCreateBinary();
+    if (analysis_mutex == NULL || analysis_state_mutex == NULL || analysis_trigger == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    return xTaskCreate(analysis_worker, "analysis_worker", 6144, NULL, 4, NULL) == pdPASS
+               ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+esp_err_t ml_analysis_request(const ml_image_options_t *options)
+{
+    if (options == NULL || analysis_state_mutex == NULL || analysis_trigger == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(analysis_state_mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (latest_available && analysis_options_match(options, &latest_result.options)) {
+        xSemaphoreGive(analysis_state_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (analysis_busy) {
+        xSemaphoreGive(analysis_state_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    pending_options = *options;
+    analysis_busy = true;
+    xSemaphoreGive(analysis_state_mutex);
+    xSemaphoreGive(analysis_trigger);
+    return ESP_OK;
+}
+
+esp_err_t ml_analysis_get_latest(const ml_image_options_t *options,
+                                 ml_analysis_result_t *result, bool *has_result,
+                                 bool *busy, uint32_t *age_ms)
+{
+    if (options == NULL || result == NULL || has_result == NULL || busy == NULL || age_ms == NULL ||
+        analysis_state_mutex == NULL) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(analysis_state_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    *has_result = latest_available && analysis_options_match(options, &latest_result.options);
+    *busy = analysis_busy;
+    *age_ms = *has_result ? analysis_now_ms() - latest_completed_ms : 0;
+    if (*has_result) *result = latest_result;
+    xSemaphoreGive(analysis_state_mutex);
+    return ESP_OK;
 }
 
 esp_err_t ml_analysis_run(const ml_image_options_t *options, ml_analysis_result_t *result)
@@ -187,12 +293,12 @@ esp_err_t ml_analysis_run(const ml_image_options_t *options, ml_analysis_result_
     }
 
     retained_frame_t next_window[3] = {0};
-    esp_err_t err = capture_copy(options, &next_window[ML_ANALYSIS_PREV]);
+    esp_err_t err = capture_copy(options, "prev", &next_window[ML_ANALYSIS_PREV]);
     if (err == ESP_OK) {
-        err = capture_copy(options, &next_window[ML_ANALYSIS_CURRENT]);
+        err = capture_copy(options, "current", &next_window[ML_ANALYSIS_CURRENT]);
     }
     if (err == ESP_OK) {
-        err = capture_copy(options, &next_window[ML_ANALYSIS_NEXT]);
+        err = capture_copy(options, "next", &next_window[ML_ANALYSIS_NEXT]);
     }
     if (err != ESP_OK) {
         for (size_t index = 0; index < 3; ++index) {

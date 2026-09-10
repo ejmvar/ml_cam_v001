@@ -453,7 +453,50 @@ security boundary.
 
 ### Bounded temporal JPEG analysis
 
-1. Run one analysis operation. It captures exactly three sequential JPEGs,
+#### Worker and bounded-state model
+
+Analysis is executed by one dedicated FreeRTOS task, `analysis_worker`.
+The HTTP handler never performs the three-camera-capture operation itself.
+
+The worker is bounded in four ways:
+
+| Resource | Bound | Purpose |
+| --- | --- | --- |
+| Worker task | One task, 6144-byte stack, priority 4 | Serializes analysis work without creating a task per request |
+| Trigger | One binary semaphore | Wakes the worker; repeated triggers cannot form an unbounded queue |
+| Pending request | One `ml_image_options_t` value | At most one mode/quality/resolution request is in flight |
+| Result cache | One latest matching result | The HTTP handler returns a cached result instead of waiting |
+
+The state transitions are:
+
+```text
+HTTP request
+    ├─ matching cached result → HTTP 200, status=cached
+    ├─ no matching result      → HTTP 202, status=queued or busy
+    └─ matching run in flight  → HTTP 202, status=busy
+
+binary semaphore → analysis_worker → three captures → publish latest result
+```
+
+`analysis_state_mutex` protects the pending request, busy flag, cached result,
+and completion timestamp. `analysis_mutex` serializes the retained temporal
+window. A request is considered a cache hit only when its mode, JPEG quality,
+and resolution all match the cached result; therefore grayscale and
+`reduced_colors` cannot receive a normal-mode result accidentally.
+
+The worker retains at most three JPEG frames, each capped at 8192 bytes, and
+decoded comparison remains capped at 4096 pixels. A failed run does not replace
+the previous successful temporal window. This gives the endpoint predictable
+RAM and concurrency behavior while allowing the expensive camera work to run
+outside the HTTP request.
+
+1. Request one analysis operation. The HTTP handler queues at most one run and
+   immediately returns the latest cached result; it never waits for capture.
+   A first request returns HTTP 202 with `status` `queued` or `busy` until a
+   result exists. Later responses are HTTP 200 with `status: "cached"`,
+   explicit `busy`, and `age_ms` metadata while the next run proceeds. A
+   concurrent trigger is deterministic: it does not enqueue another run.
+   The worker captures exactly three sequential JPEGs,
    named `prev`, `current`, and `next`, and retains bounded RAM copies:
 
    ```bash

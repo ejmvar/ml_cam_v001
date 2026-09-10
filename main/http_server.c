@@ -383,17 +383,28 @@ static esp_err_t analysis_handler_for_mode(httpd_req_t *request, ml_image_mode_t
     ml_image_options_t options;
     if (parse_options(request, &options, bound_mode) != ESP_OK) return send_error(request, "400 Bad Request", "invalid mode or quality");
     ml_analysis_result_t result;
-    esp_err_t err = ml_analysis_run(&options, &result);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Analysis request failed (%s)", esp_err_to_name(err));
-        return send_error(request, "503 Service Unavailable", "analysis capture unavailable");
+    esp_err_t err = ml_analysis_request(&options);
+    bool has_result = false, busy = false;
+    uint32_t age_ms = 0;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return send_error(request, "503 Service Unavailable", "analysis worker unavailable");
+    if (ml_analysis_get_latest(&options, &result, &has_result, &busy, &age_ms) != ESP_OK) return send_error(request, "503 Service Unavailable", "analysis state unavailable");
+    if (!has_result) {
+        httpd_resp_set_status(request, "202 Accepted");
+        httpd_resp_set_type(request, "application/json");
+        char body[128];
+        int length = snprintf(body, sizeof(body),
+                              "{\"status\":\"%s\",\"has_result\":false,\"mode\":\"%s\",\"quality\":%u}\n",
+                              busy ? "busy" : "queued", ml_image_mode_name(options.mode),
+                              (unsigned)options.quality);
+        return httpd_resp_send(request, body, length);
     }
 
     char body[1400];
     const char *decoded_status = result.decoded_available ? "available" : "unavailable";
     const char *failure_stage = result.decoded_failure_stage == NULL ? "none" : result.decoded_failure_stage;
     int length = snprintf(body, sizeof(body),
-                           "{\"mode\":\"%s\",\"quality\":%u,\"metric\":\"provisional_compressed_jpeg_signature\",\"semantic_detection\":false,\"frames\":{\"prev\":{\"size\":%u,\"fnv1a32\":\"%08x\"},\"current\":{\"size\":%u,\"fnv1a32\":\"%08x\"},\"next\":{\"size\":%u,\"fnv1a32\":\"%08x\"}},\"changes\":{\"prev_to_current\":{\"changed_bytes\":%u,\"comparison_bytes\":%u,\"change_per_mille\":%u},\"current_to_next\":{\"changed_bytes\":%u,\"comparison_bytes\":%u,\"change_per_mille\":%u}},\"decoded_pixels\":{",
+                           "{\"status\":\"cached\",\"busy\":%s,\"age_ms\":%u,\"mode\":\"%s\",\"quality\":%u,\"metric\":\"provisional_compressed_jpeg_signature\",\"semantic_detection\":false,\"frames\":{\"prev\":{\"size\":%u,\"fnv1a32\":\"%08x\"},\"current\":{\"size\":%u,\"fnv1a32\":\"%08x\"},\"next\":{\"size\":%u,\"fnv1a32\":\"%08x\"}},\"changes\":{\"prev_to_current\":{\"changed_bytes\":%u,\"comparison_bytes\":%u,\"change_per_mille\":%u},\"current_to_next\":{\"changed_bytes\":%u,\"comparison_bytes\":%u,\"change_per_mille\":%u}},\"decoded_pixels\":{",
+                            busy ? "true" : "false", (unsigned)age_ms,
                            ml_image_mode_name(result.options.mode), (unsigned)result.options.quality,
                           (unsigned)result.prev.size, (unsigned)result.prev.fnv1a32,
                           (unsigned)result.current.size, (unsigned)result.current.fnv1a32,
