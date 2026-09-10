@@ -44,12 +44,22 @@ typedef struct {
 } ml_analysis_result_t;
 
 typedef struct {
+    uint16_t width, height, roi_x, roi_y, roi_width, roi_height;
+    uint32_t score;
+    const char *evaluation;
+    const char *recommendation;
+} ml_focus_result_t;
+
+typedef struct {
     const uint8_t *data;
     size_t size;
 } ml_analysis_frame_view_t;
 
 /** Prepare the bounded RAM-only temporal window. */
 esp_err_t ml_analysis_init(void);
+
+/** Return true only after the analysis worker task has been created. */
+bool ml_analysis_is_ready(void);
 
 /** Capture exactly prev, current, and next, replacing the prior window on success. */
 esp_err_t ml_analysis_run(const ml_image_options_t *options, ml_analysis_result_t *result);
@@ -60,7 +70,11 @@ esp_err_t ml_analysis_request(const ml_image_options_t *options);
 /** Return the latest matching result and its state without waiting for analysis. */
 esp_err_t ml_analysis_get_latest(const ml_image_options_t *options,
                                  ml_analysis_result_t *result, bool *has_result,
-                                 bool *busy, uint32_t *age_ms);
+                                  bool *busy, uint32_t *age_ms);
+esp_err_t ml_focus_request(const ml_image_options_t *options, uint32_t *request_id);
+esp_err_t ml_focus_get_latest(const ml_image_options_t *options, ml_focus_result_t *result,
+                              bool *has_result, bool *busy, uint32_t *age_ms,
+                              uint32_t *completed_request_id);
 
 /** Lock the retained window for one bounded inspection/send operation. */
 esp_err_t ml_analysis_lock(void);

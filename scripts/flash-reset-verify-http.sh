@@ -56,7 +56,7 @@ printf '[flash-reset-verify] waiting %ss after flash\n' "$POST_FLASH_TIMEOUT"
 sleep "$POST_FLASH_TIMEOUT"
 
 printf '[flash-reset-verify] reset: one explicit esptool hard reset\n'
-if ! timeout --foreground 15s python -m esptool --port "$PORT" --connect-attempts 1 --after hard-reset run >/dev/null; then
+if ! timeout --foreground 15s python -m esptool --port "$PORT" --connect-attempts 1 --after hard-reset chip-id >/dev/null; then
     die 'primary failure stage: reset/readiness (explicit hard reset failed).'
 fi
 

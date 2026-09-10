@@ -37,6 +37,13 @@
 
 ## Required post-flash HTTP validation
 
+### Stable serial/reset validation (known-good)
+
+- Use the verified stable serial path: `/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A5069RR4-if00-port0`.
+- Before classifying `download mode detected` or `no sync reply` during an explicit reset as a new hardware, camera, or serial fault, verify that the validator used this path and the required reset sequence.
+- The working reset proof command is `esptool --port "$PORT" --after hard-reset chip-id`.
+- This command previously proved boot, OV3660 initialization, JPEG capture, and Wi-Fi acquisition without reading credentials. Do not inspect or log Wi-Fi secrets.
+
 - Use `scripts/flash-reset-verify-http.sh` for the repeatable post-flash check.
 - The required sequence is exactly one non-erasing `idf.py --port PORT flash`,
   a bounded post-flash wait (5 seconds by default), one explicit esptool hard

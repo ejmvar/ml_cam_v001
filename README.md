@@ -99,6 +99,37 @@ ESP-IDF v6.0.2 environment when available.
 
 ### Image endpoint contract
 
+`GET /focus` first checks for a matching cached result (same mode, quality, and
+resolution). If present, it returns HTTP 200 with `status: "cached"`,
+`fresh: false`, `source: "previous_analysis"`, its score, and its age; it does
+not enqueue another job. Otherwise, if the worker is idle, it queues exactly
+one bounded normal QVGA capture and returns HTTP 202 with `status: "queued"`.
+If the worker is busy, it returns bounded HTTP 202 with `status: "busy"`.
+Queued and busy responses never claim a score. Its JSON always exposes
+`status`, `fresh`, `age_ms`, and `source`; the endpoint does not wait for
+capture. The worker decodes
+one 1:8 RGB565 frame and computes the variance of a 4-neighbor Laplacian over
+the centered half-width/half-height ROI. The response includes `score`,
+`method`, `evaluation`, `recommendation`, decoded `dimensions`, `roi`, and
+`age_ms`. The current heuristic is `<100 = poor/adjust_focus`, `100..299 =
+acceptable/hold_position`, and `>=300 = sharp/retest`; these are provisional
+camera- and exposure-dependent thresholds, not a calibrated optical measure.
+Flat scenes can score poorly and texture, noise, lighting, compression, and
+subject distance can change the score. Repeat `/focus` after adjusting focus.
+`/focus` is an analysis request, not `/capture.jpg`: `/capture.jpg` returns a
+JPEG image (fresh-first with a bounded cache fallback), while `/focus` returns
+the bounded score and explicitly identifies whether that score is current.
+WebSocket streaming is intentionally deferred: it would add connection state,
+continuous capture pressure, and delivery/backpressure complexity without
+improving this bounded single-frame decision procedure.
+
+Analysis endpoints return HTTP 503 while the worker is unavailable, including
+when startup cannot allocate the worker task. They never queue a request in
+that state, so a failed startup cannot leave a permanent `busy` response.
+The worker uses a 6144-byte stack for the no-PSRAM target. The watchdog is
+optional; if its bounded task cannot be created, the worker still starts and
+logs the degraded timeout-recovery mode.
+
 Every endpoint is listed below. All image and analysis URLs accept only
 `quality=10..30`; invalid values return HTTP 400. `/health` accepts the same
 range and reports the selected mode and quality without capturing.

@@ -15,6 +15,8 @@ ALLOWED_MARKERS = (
     "Discarded one warm-up JPEG frame",
     "Capture validation:",
     "ML transform failure:",
+    "stage=",
+    "worker stage=",
 )
 
 

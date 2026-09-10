@@ -19,6 +19,9 @@ static const size_t MAX_JPEG_SIZE = 8192;
 static const size_t MAX_DECODED_PIXELS = 4096;
 static const size_t MAX_DECODED_BYTES = MAX_DECODED_PIXELS * sizeof(uint16_t);
 static const size_t JPEG_WORKING_BUFFER_SIZE = 4096;
+static const uint32_t ANALYSIS_TASK_STACK_SIZE = 6144;
+static const uint32_t ANALYSIS_JOB_TIMEOUT_MS = 10000;
+static const uint32_t ANALYSIS_WATCHDOG_STACK_SIZE = 2048;
 
 typedef struct {
     uint8_t *data;
@@ -42,10 +45,62 @@ static ml_image_options_t pending_options;
 static bool latest_available;
 static bool analysis_busy;
 static uint32_t latest_completed_ms;
+static ml_focus_result_t latest_focus_result;
+static bool latest_focus_available;
+static uint32_t latest_focus_completed_ms;
+static ml_image_options_t latest_focus_options;
+static bool pending_focus;
+static bool analysis_faulted;
+static bool analysis_job_active;
+static uint32_t pending_job_generation;
+static uint32_t active_job_generation;
+static uint32_t analysis_job_started_ms;
+static uint32_t pending_focus_request_id;
+static uint32_t next_focus_request_id;
+static uint32_t latest_focus_request_id;
+static bool analysis_initialized;
+static TaskHandle_t analysis_worker_task;
+static TaskHandle_t analysis_watchdog_task;
+static esp_err_t focus_run(const ml_image_options_t *options, ml_focus_result_t *result);
+static uint32_t analysis_elapsed_ms(int64_t started_us);
+static uint32_t analysis_now_ms(void);
+
+bool ml_analysis_is_ready(void)
+{
+    return analysis_initialized && analysis_worker_task != NULL;
+}
+
+static void analysis_watchdog(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        if (analysis_state_mutex == NULL ||
+            xSemaphoreTake(analysis_state_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+        if (analysis_job_active && !analysis_faulted &&
+            analysis_now_ms() - analysis_job_started_ms >= ANALYSIS_JOB_TIMEOUT_MS) {
+            analysis_faulted = true;
+            analysis_job_active = false;
+            analysis_busy = false;
+            ESP_LOGE(TAG, "worker stage=job_timeout timeout_ms=%u; camera driver remains owned by worker",
+                     (unsigned)ANALYSIS_JOB_TIMEOUT_MS);
+        }
+        xSemaphoreGive(analysis_state_mutex);
+    }
+}
 
 static uint32_t analysis_now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static void analysis_log_stage(const char *stage, bool focus_job, int64_t started_us)
+{
+    ESP_LOGI(TAG, "worker stage=%s job=%s elapsed_ms=%u", stage,
+             focus_job ? "focus" : "analysis",
+             (unsigned)analysis_elapsed_ms(started_us));
 }
 
 static bool analysis_options_match(const ml_image_options_t *left,
@@ -59,22 +114,56 @@ static void analysis_worker(void *argument)
 {
     (void)argument;
     for (;;) {
-        xSemaphoreTake(analysis_trigger, portMAX_DELAY);
+        if (xSemaphoreTake(analysis_trigger, pdMS_TO_TICKS(1000)) != pdTRUE) continue;
+        int64_t started_us = esp_timer_get_time();
+        analysis_log_stage("triggered", false, started_us);
         ml_image_options_t options;
-        if (xSemaphoreTake(analysis_state_mutex, portMAX_DELAY) != pdTRUE) continue;
+        if (xSemaphoreTake(analysis_state_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGE(TAG, "worker stage=state_acquire_failed elapsed_ms=%u",
+                     (unsigned)analysis_elapsed_ms(started_us));
+            continue;
+        }
         options = pending_options;
+        bool focus_job = pending_focus;
+        uint32_t focus_request_id = pending_focus_request_id;
+        uint32_t job_generation = pending_job_generation;
+        bool job_owned = !analysis_faulted && analysis_job_active &&
+                         active_job_generation == job_generation;
         xSemaphoreGive(analysis_state_mutex);
+        if (!job_owned) {
+            ESP_LOGE(TAG, "worker stage=job_abandoned generation=%u",
+                     (unsigned)job_generation);
+            continue;
+        }
+        analysis_log_stage("job_start", focus_job, started_us);
 
         ml_analysis_result_t result;
-        esp_err_t err = ml_analysis_run(&options, &result);
-        if (xSemaphoreTake(analysis_state_mutex, portMAX_DELAY) == pdTRUE) {
-            if (err == ESP_OK) {
-                latest_result = result;
-                latest_completed_ms = analysis_now_ms();
-                latest_available = true;
+        ml_focus_result_t focus_result;
+        esp_err_t err = focus_job ? focus_run(&options, &focus_result) : ml_analysis_run(&options, &result);
+        analysis_log_stage(err == ESP_OK ? "job_success" : "job_failed", focus_job, started_us);
+        if (xSemaphoreTake(analysis_state_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            bool still_owned = analysis_job_active && !analysis_faulted &&
+                               active_job_generation == job_generation;
+            if (still_owned && err == ESP_OK) {
+                if (focus_job) { latest_focus_result = focus_result; latest_focus_options = options; latest_focus_completed_ms = analysis_now_ms(); latest_focus_request_id = focus_request_id; latest_focus_available = true; }
+                else { latest_result = result; latest_completed_ms = analysis_now_ms(); latest_available = true; }
             }
-            analysis_busy = false;
+            if (still_owned) {
+                analysis_job_active = false;
+                analysis_busy = false;
+                ESP_LOGI(TAG, "worker stage=analysis_busy_clear job=%s error=%s elapsed_ms=%u",
+                         focus_job ? "focus" : "analysis", esp_err_to_name(err),
+                         (unsigned)analysis_elapsed_ms(started_us));
+            } else {
+                ESP_LOGW(TAG, "worker stage=late_completion_ignored job=%s error=%s elapsed_ms=%u",
+                         focus_job ? "focus" : "analysis", esp_err_to_name(err),
+                         (unsigned)analysis_elapsed_ms(started_us));
+            }
             xSemaphoreGive(analysis_state_mutex);
+        } else {
+            ESP_LOGE(TAG, "worker stage=busy_clear_state_acquire_failed job=%s elapsed_ms=%u",
+                     focus_job ? "focus" : "analysis",
+                     (unsigned)analysis_elapsed_ms(started_us));
         }
     }
 }
@@ -113,6 +202,7 @@ static esp_err_t capture_copy(const ml_image_options_t *options, const char *fra
                               retained_frame_t *destination)
 {
     int64_t started_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "stage=capture_start frame=%s", frame_name);
     uint8_t *jpeg = NULL;
     size_t jpeg_size = 0;
     esp_err_t err = ml_camera_capture_jpeg(options, &jpeg, &jpeg_size);
@@ -152,6 +242,8 @@ static esp_err_t decode_frame(const retained_frame_t *source,
         working == NULL || source->data == NULL || source->size == 0 || failure_stage == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
+    ESP_LOGI(TAG, "stage=decode_start frame=%s bytes=%u", frame_name,
+             (unsigned)source->size);
 
     esp_jpeg_image_cfg_t config = {
         .indata = source->data,
@@ -178,7 +270,7 @@ static esp_err_t decode_frame(const retained_frame_t *source,
     }
 
     config.outbuf = (uint8_t *)pixels;
-    config.outbuf_size = (uint32_t)info.output_len;
+    config.outbuf_size = (uint32_t)scaled.bytes;
     config.advanced.working_buffer = working;
     config.advanced.working_buffer_size = JPEG_WORKING_BUFFER_SIZE;
     esp_jpeg_image_output_t output = {0};
@@ -234,25 +326,51 @@ static ml_analysis_decoded_pair_t compare_decoded(const decoded_frame_t *left,
 
 esp_err_t ml_analysis_init(void)
 {
-    if (analysis_mutex != NULL) {
+    if (ml_analysis_is_ready()) {
         return ESP_OK;
     }
     analysis_mutex = xSemaphoreCreateMutex();
     analysis_state_mutex = xSemaphoreCreateMutex();
     analysis_trigger = xSemaphoreCreateBinary();
     if (analysis_mutex == NULL || analysis_state_mutex == NULL || analysis_trigger == NULL) {
+        if (analysis_trigger != NULL) vSemaphoreDelete(analysis_trigger);
+        if (analysis_state_mutex != NULL) vSemaphoreDelete(analysis_state_mutex);
+        if (analysis_mutex != NULL) vSemaphoreDelete(analysis_mutex);
+        analysis_trigger = NULL;
+        analysis_state_mutex = NULL;
+        analysis_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
-    return xTaskCreate(analysis_worker, "analysis_worker", 6144, NULL, 4, NULL) == pdPASS
-               ? ESP_OK : ESP_ERR_NO_MEM;
+    if (xTaskCreate(analysis_worker, "analysis_worker", ANALYSIS_TASK_STACK_SIZE,
+                    NULL, 4, &analysis_worker_task) != pdPASS) {
+        vSemaphoreDelete(analysis_trigger);
+        vSemaphoreDelete(analysis_state_mutex);
+        vSemaphoreDelete(analysis_mutex);
+        analysis_trigger = NULL;
+        analysis_state_mutex = NULL;
+        analysis_mutex = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    analysis_initialized = true;
+    if (xTaskCreate(analysis_watchdog, "analysis_watchdog", ANALYSIS_WATCHDOG_STACK_SIZE,
+                    NULL, 5, &analysis_watchdog_task) != pdPASS) {
+        analysis_watchdog_task = NULL;
+        ESP_LOGW(TAG, "analysis watchdog unavailable; worker remains active without timeout recovery");
+    }
+    return ESP_OK;
 }
 
 esp_err_t ml_analysis_request(const ml_image_options_t *options)
 {
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
     if (options == NULL || analysis_state_mutex == NULL || analysis_trigger == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     if (xSemaphoreTake(analysis_state_mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (analysis_faulted) {
+        xSemaphoreGive(analysis_state_mutex);
+        return ESP_FAIL;
+    }
     if (latest_available && analysis_options_match(options, &latest_result.options)) {
         xSemaphoreGive(analysis_state_mutex);
         return ESP_ERR_INVALID_STATE;
@@ -262,7 +380,12 @@ esp_err_t ml_analysis_request(const ml_image_options_t *options)
         return ESP_ERR_INVALID_STATE;
     }
     pending_options = *options;
+    pending_focus = false;
     analysis_busy = true;
+    pending_job_generation++;
+    active_job_generation = pending_job_generation;
+    analysis_job_started_ms = analysis_now_ms();
+    analysis_job_active = true;
     xSemaphoreGive(analysis_state_mutex);
     xSemaphoreGive(analysis_trigger);
     return ESP_OK;
@@ -272,9 +395,10 @@ esp_err_t ml_analysis_get_latest(const ml_image_options_t *options,
                                  ml_analysis_result_t *result, bool *has_result,
                                  bool *busy, uint32_t *age_ms)
 {
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
     if (options == NULL || result == NULL || has_result == NULL || busy == NULL || age_ms == NULL ||
         analysis_state_mutex == NULL) return ESP_ERR_INVALID_ARG;
-    if (xSemaphoreTake(analysis_state_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(analysis_state_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     *has_result = latest_available && analysis_options_match(options, &latest_result.options);
     *busy = analysis_busy;
     *age_ms = *has_result ? analysis_now_ms() - latest_completed_ms : 0;
@@ -283,12 +407,95 @@ esp_err_t ml_analysis_get_latest(const ml_image_options_t *options,
     return ESP_OK;
 }
 
+esp_err_t ml_focus_request(const ml_image_options_t *options, uint32_t *request_id)
+{
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (options == NULL || request_id == NULL || analysis_state_mutex == NULL || analysis_trigger == NULL) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(analysis_state_mutex, 0) != pdTRUE) return ESP_ERR_TIMEOUT;
+    if (analysis_faulted) { xSemaphoreGive(analysis_state_mutex); return ESP_FAIL; }
+    if (analysis_busy) { xSemaphoreGive(analysis_state_mutex); return ESP_ERR_INVALID_STATE; }
+    pending_options = *options; pending_focus = true; analysis_busy = true;
+    pending_job_generation++;
+    active_job_generation = pending_job_generation;
+    analysis_job_started_ms = analysis_now_ms();
+    analysis_job_active = true;
+    pending_focus_request_id = ++next_focus_request_id;
+    *request_id = pending_focus_request_id;
+    xSemaphoreGive(analysis_state_mutex); xSemaphoreGive(analysis_trigger); return ESP_OK;
+}
+
+esp_err_t ml_focus_get_latest(const ml_image_options_t *options, ml_focus_result_t *result,
+                              bool *has_result, bool *busy, uint32_t *age_ms,
+                              uint32_t *completed_request_id)
+{
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (options == NULL || result == NULL || has_result == NULL || busy == NULL || age_ms == NULL || completed_request_id == NULL || analysis_state_mutex == NULL) return ESP_ERR_INVALID_ARG;
+    if (xSemaphoreTake(analysis_state_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    *has_result = latest_focus_available && analysis_options_match(options, &latest_focus_options); *busy = analysis_busy;
+    *age_ms = *has_result ? analysis_now_ms() - latest_focus_completed_ms : 0;
+    *completed_request_id = *has_result ? latest_focus_request_id : 0;
+    if (*has_result) *result = latest_focus_result;
+    xSemaphoreGive(analysis_state_mutex); return ESP_OK;
+}
+
+static uint8_t focus_luminance(uint16_t pixel)
+{
+    uint32_t r = (pixel >> 11) & 31, g = (pixel >> 5) & 63, b = pixel & 31;
+    return (uint8_t)((77 * r * 255 / 31 + 150 * g * 255 / 63 + 29 * b * 255 / 31) / 256);
+}
+
+static esp_err_t focus_run(const ml_image_options_t *options, ml_focus_result_t *result)
+{
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
+    if (options == NULL || result == NULL || analysis_mutex == NULL) return ESP_ERR_INVALID_ARG;
+    int64_t started_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "stage=focus_run_start");
+    ESP_LOGI(TAG, "stage=analysis_mutex_acquire_start");
+    if (xSemaphoreTake(analysis_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "stage=analysis_mutex_acquire_failed elapsed_ms=%u",
+                 (unsigned)analysis_elapsed_ms(started_us));
+        ESP_LOGI(TAG, "stage=focus_run_end error=%s elapsed_ms=%u",
+                 esp_err_to_name(ESP_ERR_TIMEOUT),
+                 (unsigned)analysis_elapsed_ms(started_us));
+        return ESP_ERR_TIMEOUT;
+    }
+    ESP_LOGI(TAG, "stage=analysis_mutex_acquired elapsed_ms=%u",
+             (unsigned)analysis_elapsed_ms(started_us));
+    retained_frame_t frame = {0}; decoded_frame_t decoded = {0};
+    uint16_t *pixels = malloc(MAX_DECODED_BYTES); uint8_t *working = malloc(JPEG_WORKING_BUFFER_SIZE);
+    const char *failure = NULL;
+    esp_err_t err = pixels == NULL || working == NULL ? ESP_ERR_NO_MEM : capture_copy(options, "focus", &frame);
+    if (err == ESP_OK) err = decode_frame(&frame, "focus", pixels, working, &decoded, &failure);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "stage=focus_scan_start dimensions=%ux%u",
+                 (unsigned)decoded.width, (unsigned)decoded.height);
+        uint16_t rx = decoded.width / 4, ry = decoded.height / 4, rw = decoded.width / 2, rh = decoded.height / 2;
+        uint64_t sum = 0, squares = 0; uint32_t count = 0;
+        for (uint16_t y = ry + 1; y + 1 < ry + rh; ++y) for (uint16_t x = rx + 1; x + 1 < rx + rw; ++x) {
+            int lap = 4 * focus_luminance(decoded.pixels[y * decoded.width + x]) - focus_luminance(decoded.pixels[(y - 1) * decoded.width + x]) - focus_luminance(decoded.pixels[(y + 1) * decoded.width + x]) - focus_luminance(decoded.pixels[y * decoded.width + x - 1]) - focus_luminance(decoded.pixels[y * decoded.width + x + 1]);
+            sum += (int64_t)lap; squares += (uint64_t)((int64_t)lap * lap); ++count;
+        }
+        uint64_t variance = count == 0 ? 0 : (squares * count - sum * sum) / ((uint64_t)count * count);
+        memset(result, 0, sizeof(*result)); result->width = decoded.width; result->height = decoded.height; result->roi_x = rx; result->roi_y = ry; result->roi_width = rw; result->roi_height = rh; result->score = (uint32_t)variance;
+        result->evaluation = variance < 100 ? "poor" : variance < 300 ? "acceptable" : "sharp";
+        result->recommendation = variance < 100 ? "adjust_focus" : variance < 300 ? "hold_position" : "retest";
+        ESP_LOGI(TAG, "stage=focus_scan_end score=%u elapsed_ms=%u",
+                 (unsigned)result->score, (unsigned)analysis_elapsed_ms(started_us));
+    }
+    free(frame.data); free(pixels); free(working); xSemaphoreGive(analysis_mutex);
+    ESP_LOGI(TAG, "stage=focus_run_end error=%s elapsed_ms=%u", esp_err_to_name(err),
+             (unsigned)analysis_elapsed_ms(started_us));
+    return err;
+}
+
 esp_err_t ml_analysis_run(const ml_image_options_t *options, ml_analysis_result_t *result)
 {
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
     if (options == NULL || result == NULL || analysis_mutex == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (xSemaphoreTake(analysis_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "stage=analysis_mutex_acquire_failed job=analysis");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -379,6 +586,7 @@ esp_err_t ml_analysis_run(const ml_image_options_t *options, ml_analysis_result_
 
 esp_err_t ml_analysis_lock(void)
 {
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
     if (analysis_mutex == NULL || xSemaphoreTake(analysis_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
@@ -388,6 +596,7 @@ esp_err_t ml_analysis_lock(void)
 esp_err_t ml_analysis_get_frame(ml_analysis_frame_t frame,
                                 ml_analysis_frame_view_t *view)
 {
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
     if (view == NULL || frame < ML_ANALYSIS_PREV || frame > ML_ANALYSIS_NEXT) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -401,6 +610,7 @@ esp_err_t ml_analysis_get_frame(ml_analysis_frame_t frame,
 
 esp_err_t ml_analysis_get_options(ml_image_options_t *options)
 {
+    if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;
     if (options == NULL) return ESP_ERR_INVALID_ARG;
     *options = retained_options;
     return retained[ML_ANALYSIS_PREV].data == NULL ? ESP_ERR_NOT_FOUND : ESP_OK;

@@ -217,7 +217,12 @@ static esp_err_t capture_one_locked(camera_fb_t **frame)
 
     if (!camera_warmup_done) {
         /* One bounded discard lets startup JPEG output settle; never retry. */
+        int64_t warmup_started_us = esp_timer_get_time();
+        ESP_LOGI(TAG, "stage=camera_frame_get_start purpose=warmup");
         camera_fb_t *warmup = esp_camera_fb_get();
+        ESP_LOGI(TAG, "stage=camera_frame_get_end purpose=warmup result=%s elapsed_ms=%u",
+                 warmup == NULL ? "none" : "frame",
+                 (unsigned)camera_elapsed_ms(warmup_started_us));
         if (warmup == NULL) {
             ESP_LOGE(TAG, "Camera warm-up capture failed; no frame buffer was returned");
             return ESP_ERR_NO_MEM;
@@ -228,7 +233,12 @@ static esp_err_t capture_one_locked(camera_fb_t **frame)
         camera_warmup_done = true;
     }
 
+    int64_t capture_started_us = esp_timer_get_time();
+    ESP_LOGI(TAG, "stage=camera_frame_get_start purpose=capture");
     camera_fb_t *captured = esp_camera_fb_get();
+    ESP_LOGI(TAG, "stage=camera_frame_get_end purpose=capture result=%s elapsed_ms=%u",
+             captured == NULL ? "none" : "frame",
+             (unsigned)camera_elapsed_ms(capture_started_us));
     if (captured == NULL) {
         ESP_LOGE(TAG, "JPEG capture failed; no frame buffer was returned");
         return ESP_ERR_NO_MEM;
@@ -450,7 +460,7 @@ static void log_transform_failure(ml_image_mode_t mode, const char *stage,
 }
 
 esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
-                                 uint8_t **data, size_t *size)
+                                  uint8_t **data, size_t *size)
 {
     int64_t started_us = esp_timer_get_time();
     if (options == NULL || data == NULL || size == NULL ||
@@ -468,12 +478,17 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
         }
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGI(TAG, "stage=camera_mutex_acquire_start mode=%s resolution=%s",
+             ml_image_mode_name(options->mode), ml_camera_resolution_name(options->resolution));
     if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         if (options->mode != ML_IMAGE_MODE_NORMAL) {
             log_transform_failure(options->mode, "mutex", ESP_ERR_TIMEOUT, 0, 0, 0, 0, 0);
         }
         return ESP_ERR_TIMEOUT;
     }
+    ESP_LOGI(TAG, "stage=camera_mutex_acquired mode=%s elapsed_ms=%u",
+             ml_image_mode_name(options->mode), (unsigned)camera_elapsed_ms(started_us));
+    ESP_LOGI(TAG, "stage=capture_start mode=%s", ml_image_mode_name(options->mode));
     sensor_t *sensor = esp_camera_sensor_get();
     framesize_t frame_size = options->resolution == ML_CAMERA_RESOLUTION_QQVGA ? FRAMESIZE_QQVGA :
                              options->resolution == ML_CAMERA_RESOLUTION_HQVGA ? FRAMESIZE_HQVGA : FRAMESIZE_QVGA;
@@ -537,6 +552,9 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
             }
         }
         ml_camera_release(frame);
+        ESP_LOGI(TAG, "stage=capture_end mode=%s error=%s elapsed_ms=%u",
+                 ml_image_mode_name(options->mode), esp_err_to_name(err),
+                 (unsigned)camera_elapsed_ms(started_us));
         return err;
     }
 
@@ -686,5 +704,8 @@ esp_err_t ml_camera_capture_jpeg(const ml_image_options_t *options,
         free(*data); *data = NULL; *size = 0;
     }
     free(pixels); free(working); ml_camera_release(frame);
+    ESP_LOGI(TAG, "stage=capture_end mode=%s error=%s elapsed_ms=%u",
+             ml_image_mode_name(options->mode), esp_err_to_name(err),
+             (unsigned)camera_elapsed_ms(started_us));
     return err;
 }

@@ -5,6 +5,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+from focus_metric import laplacian_variance_center_roi
 HTTP_SOURCE = (ROOT / "main" / "http_server.c").read_text()
 CAMERA_SOURCE = (ROOT / "main" / "camera.c").read_text()
 
@@ -216,6 +218,28 @@ def test_analysis_is_bounded_async_and_returns_cached_state():
     assert '202 Accepted' in HTTP_SOURCE
 
 
+def test_analysis_worker_failure_is_fail_closed_and_uses_no_psram_stack_budget():
+    analysis = (ROOT / "main" / "analysis.c").read_text()
+    assert 'static const uint32_t ANALYSIS_TASK_STACK_SIZE = 6144' in analysis
+    assert 'static bool analysis_initialized' in analysis
+    assert 'static TaskHandle_t analysis_worker_task' in analysis
+    assert 'if (!ml_analysis_is_ready()) return ESP_ERR_INVALID_STATE;' in analysis
+    assert 'vSemaphoreDelete(analysis_trigger)' in analysis
+    assert 'analysis watchdog unavailable; worker remains active' in analysis
+    assert 'if (!ml_analysis_is_ready()) return send_error(request, "503 Service Unavailable", "analysis worker unavailable")' in HTTP_SOURCE
+
+
+def test_analysis_decoder_uses_derived_scaled_bound():
+    analysis = (ROOT / "main" / "analysis.c").read_text()
+    decoder = analysis[analysis.index("static esp_err_t decode_frame"):
+                       analysis.index("static ml_analysis_decoded_pair_t compare_decoded")]
+
+    derive = decoder.index("ml_jpeg_derive_scaled_output")
+    bound = decoder.index("config.outbuf_size = (uint32_t)scaled.bytes;")
+    assert derive < bound
+    assert "config.outbuf_size = (uint32_t)info.output_len;" not in decoder
+
+
 def test_analysis_cache_requires_matching_mode_quality_and_resolution():
     analysis = (ROOT / "main" / "analysis.c").read_text()
     assert 'analysis_options_match(options, &latest_result.options)' in analysis
@@ -223,3 +247,38 @@ def test_analysis_cache_requires_matching_mode_quality_and_resolution():
     assert 'left->quality == right->quality' in analysis
     assert 'left->resolution == right->resolution' in analysis
     assert 'ml_analysis_get_latest(&options' in HTTP_SOURCE
+
+
+def test_focus_flat_frame_scores_zero():
+    pixels = [[10] * 8 for _ in range(8)]
+    assert laplacian_variance_center_roi(pixels, 8, 8) == 0
+
+
+def test_focus_returns_matching_cache_before_requesting_new_job():
+    handler = HTTP_SOURCE[HTTP_SOURCE.index("static esp_err_t focus_handler"):]
+    assert handler.index("ml_focus_get_latest") < handler.index("ml_focus_request")
+    cached = handler[handler.index("if (has_result)"):handler.index("const char *status")]
+    assert '"status\\\":\\\"cached' in cached
+    assert '"source\\\":\\\"previous_analysis' in cached
+    assert '"fresh\\\":false' in cached
+    assert '"score\\\":%u' in cached
+    assert "ml_focus_request" not in cached
+
+
+def test_focus_edge_frame_scores_above_flat_frame():
+    pixels = [[0 if x < 4 else 255 for x in range(8)] for _ in range(8)]
+    assert laplacian_variance_center_roi(pixels, 8, 8) > 0
+
+
+def test_focus_json_contract_is_explicit_in_firmware():
+    assert '"/focus"' in HTTP_SOURCE
+    for field in ("score", "method", "evaluation", "recommendation", "dimensions", "roi", "status", "fresh", "age_ms", "source"):
+        assert f'\\"{field}' in HTTP_SOURCE
+    assert "laplacian_variance_center_roi" in HTTP_SOURCE
+
+
+def test_focus_freshness_cannot_claim_cached_result_is_current():
+    assert '"source\\\":\\\"previous_analysis' in HTTP_SOURCE
+    assert '"fresh\\\":false' in HTTP_SOURCE
+    assert '"score\\\":%u' in HTTP_SOURCE
+    assert '\\"has_result\\":false' in HTTP_SOURCE

@@ -208,8 +208,13 @@ static esp_err_t send_cached_capture(httpd_req_t *request,
         httpd_resp_set_hdr(request, "X-Capture-Fallback-Reason", fallback_reason);
     }
     httpd_resp_set_type(request, "image/jpeg");
+    ESP_LOGI(TAG, "JPEG fallback response send start status=200 source=%s bytes=%u",
+             source, (unsigned)size);
     esp_err_t err = httpd_resp_send(request, (const char *)copy, size);
     free(copy);
+    ESP_LOGI(TAG, "JPEG fallback response send end status=%s bytes=%u error=%s",
+             err == ESP_OK ? "200" : "send-error", (unsigned)size,
+             esp_err_to_name(err));
     return err;
 }
 
@@ -244,6 +249,8 @@ static esp_err_t health_handler(httpd_req_t *request)
 static esp_err_t capture_handler_for_resolution(httpd_req_t *request, ml_image_mode_t bound_mode,
                                                 ml_camera_resolution_t resolution)
 {
+    ESP_LOGI(TAG, "Capture request entry mode=%s resolution=%s",
+             ml_image_mode_name(bound_mode), ml_camera_resolution_name(resolution));
     ml_image_options_t options;
     if (parse_options(request, &options, bound_mode) != ESP_OK) return send_error(request, "400 Bad Request", "invalid mode or quality");
     if (bound_mode == ML_IMAGE_MODE_NORMAL && options.mode != ML_IMAGE_MODE_NORMAL) {
@@ -254,10 +261,15 @@ static esp_err_t capture_handler_for_resolution(httpd_req_t *request, ml_image_m
     uint8_t *data = NULL;
     size_t size = 0;
     esp_err_t capture_err = ml_camera_capture_jpeg(&options, &data, &size);
+    ESP_LOGI(TAG, "Capture result mode=%s resolution=%s quality=%u error=%s bytes=%u",
+             ml_image_mode_name(options.mode), ml_camera_resolution_name(options.resolution),
+             (unsigned)options.quality, esp_err_to_name(capture_err), (unsigned)size);
     if (capture_err != ESP_OK) {
         if (options.mode == ML_IMAGE_MODE_NORMAL) {
             esp_err_t fallback_err = send_cached_capture(request, &options, "cache-fallback",
                                                          "invalid-fresh-jpeg");
+            ESP_LOGW(TAG, "Capture fallback selection source=cache-fallback error=%s",
+                     esp_err_to_name(fallback_err));
             if (fallback_err == ESP_OK) return ESP_OK;
         }
         return send_error(request, "503 Service Unavailable", "image transform unavailable");
@@ -270,8 +282,13 @@ static esp_err_t capture_handler_for_resolution(httpd_req_t *request, ml_image_m
     snprintf(duration, sizeof(duration), "%u", (unsigned)(now_ms() - started_ms));
     httpd_resp_set_hdr(request, "X-Capture-Duration-Ms", duration);
     httpd_resp_set_hdr(request, "X-Image-Source", "fresh");
+    ESP_LOGI(TAG, "JPEG response send start status=200 bytes=%u duration_ms=%u",
+             (unsigned)size, (unsigned)(now_ms() - started_ms));
     esp_err_t send_err = httpd_resp_send(request, (const char *)data, size);
     free(data);
+    ESP_LOGI(TAG, "JPEG response send end status=%s bytes=%u error=%s",
+             send_err == ESP_OK ? "200" : "send-error", (unsigned)size,
+             esp_err_to_name(send_err));
     if (send_err != ESP_OK) {
         ESP_LOGW(TAG, "JPEG response send failed (%s)",
                  esp_err_to_name(send_err));
@@ -382,6 +399,7 @@ static esp_err_t analysis_handler_for_mode(httpd_req_t *request, ml_image_mode_t
 {
     ml_image_options_t options;
     if (parse_options(request, &options, bound_mode) != ESP_OK) return send_error(request, "400 Bad Request", "invalid mode or quality");
+    if (!ml_analysis_is_ready()) return send_error(request, "503 Service Unavailable", "analysis worker unavailable");
     ml_analysis_result_t result;
     esp_err_t err = ml_analysis_request(&options);
     bool has_result = false, busy = false;
@@ -452,6 +470,30 @@ static esp_err_t analysis_handler_for_mode(httpd_req_t *request, ml_image_mode_t
 static esp_err_t analysis_handler(httpd_req_t *request)
 {
     return analysis_handler_for_mode(request, ML_IMAGE_MODE_NORMAL);
+}
+
+static esp_err_t focus_handler(httpd_req_t *request)
+{
+    ml_image_options_t options;
+    if (parse_options(request, &options, ML_IMAGE_MODE_NORMAL) != ESP_OK) return send_error(request, "400 Bad Request", "invalid mode or quality");
+    if (!ml_analysis_is_ready()) return send_error(request, "503 Service Unavailable", "analysis worker unavailable");
+    ml_focus_result_t result; bool has_result = false, busy = false; uint32_t age_ms = 0, completed_request_id = 0;
+    if (ml_focus_get_latest(&options, &result, &has_result, &busy, &age_ms, &completed_request_id) != ESP_OK) return send_error(request, "503 Service Unavailable", "analysis state unavailable");
+    httpd_resp_set_type(request, "application/json");
+    if (has_result) {
+        char body[520]; int length = snprintf(body, sizeof(body), "{\"status\":\"cached\",\"fresh\":false,\"age_ms\":%u,\"source\":\"previous_analysis\",\"has_result\":true,\"score\":%u,\"method\":\"laplacian_variance_center_roi\",\"evaluation\":\"%s\",\"recommendation\":\"%s\",\"mode\":\"%s\",\"quality\":%u,\"dimensions\":{\"width\":%u,\"height\":%u},\"roi\":{\"x\":%u,\"y\":%u,\"width\":%u,\"height\":%u}}\n", (unsigned)age_ms, (unsigned)result.score, result.evaluation, result.recommendation, ml_image_mode_name(options.mode), (unsigned)options.quality, result.width, result.height, result.roi_x, result.roi_y, result.roi_width, result.roi_height);
+        return length < 0 || (size_t)length >= sizeof(body) ? ESP_FAIL : httpd_resp_send(request, body, length);
+    }
+    const char *status = "busy";
+    if (!busy) {
+        uint32_t request_id = 0;
+        esp_err_t err = ml_focus_request(&options, &request_id);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return send_error(request, "503 Service Unavailable", "analysis worker unavailable");
+        status = err == ESP_OK ? "queued" : "busy";
+    }
+    httpd_resp_set_status(request, "202 Accepted");
+    char body[220]; int length = snprintf(body, sizeof(body), "{\"status\":\"%s\",\"fresh\":false,\"age_ms\":0,\"source\":\"none\",\"has_result\":false,\"mode\":\"%s\",\"quality\":%u}\n", status, ml_image_mode_name(options.mode), (unsigned)options.quality);
+    return length < 0 || (size_t)length >= sizeof(body) ? ESP_FAIL : httpd_resp_send(request, body, length);
 }
 
 static esp_err_t retained_frame_handler_for_mode(httpd_req_t *request, ml_analysis_frame_t frame,
@@ -560,6 +602,7 @@ esp_err_t ml_http_server_start(void)
     const httpd_uri_t latest_uri = {.uri = "/capture/latest.jpg", .method = HTTP_GET, .handler = latest_handler};
     const httpd_uri_t periodic_uri = {.uri = "/capture/periodic/latest.jpg", .method = HTTP_GET, .handler = periodic_latest_handler};
     const httpd_uri_t analysis_uri = {.uri = "/analysis", .method = HTTP_GET, .handler = analysis_handler};
+    const httpd_uri_t focus_uri = {.uri = "/focus", .method = HTTP_GET, .handler = focus_handler};
     const httpd_uri_t prev_uri = {.uri = "/analysis/prev.jpg", .method = HTTP_GET, .handler = prev_handler};
     const httpd_uri_t current_uri = {.uri = "/analysis/current.jpg", .method = HTTP_GET, .handler = current_handler};
     const httpd_uri_t next_uri = {.uri = "/analysis/next.jpg", .method = HTTP_GET, .handler = next_handler};
@@ -588,6 +631,7 @@ esp_err_t ml_http_server_start(void)
     }
     if (err == ESP_OK) { err = httpd_register_uri_handler(server_handle, &periodic_uri); }
     if (err == ESP_OK) { err = httpd_register_uri_handler(server_handle, &analysis_uri); }
+    if (err == ESP_OK) { err = httpd_register_uri_handler(server_handle, &focus_uri); }
     if (err == ESP_OK) { err = httpd_register_uri_handler(server_handle, &prev_uri); }
     if (err == ESP_OK) { err = httpd_register_uri_handler(server_handle, &current_uri); }
     if (err == ESP_OK) { err = httpd_register_uri_handler(server_handle, &next_uri); }
