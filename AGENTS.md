@@ -34,3 +34,20 @@
 - Treat build artifacts, serial output, and NVS images as sensitive whenever
   they may contain provisioned credentials.
 - Do not modify, overwrite, or delete secret files.
+
+## Required post-flash HTTP validation
+
+- Use `scripts/flash-reset-verify-http.sh` for the repeatable post-flash check.
+- The required sequence is exactly one non-erasing `idf.py --port PORT flash`,
+  a bounded post-flash wait (5 seconds by default), one explicit esptool hard
+  reset, and a bounded readiness wait (30 seconds by default).
+- Readiness must be proven by the filtered log's approved
+  `Image checkpoint URL: http://.../capture.jpg` marker; extract the IPv4
+  address only from that marker and fail closed when it is absent.
+- After readiness, use `wget` exactly once per URL for `/health`,
+  `/capture.jpg`, `/analysis`, `/analysis/prev.jpg`,
+  `/analysis/current.jpg`, and `/analysis/next.jpg`. Use bounded connect/read
+  timeouts, no blind retries, and pipe response bodies to the existing
+  in-memory JPEG/JSON checkers without saving them.
+- Never erase NVS, inspect or print the Wi-Fi secret file, retain raw serial
+  logs, or print credentials during this sequence.

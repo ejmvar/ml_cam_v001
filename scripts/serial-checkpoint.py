@@ -13,6 +13,8 @@ ALLOWED_MARKERS = (
     "HTTP checkpoint server ready:",
     "Camera initialized",
     "Discarded one warm-up JPEG frame",
+    "Capture validation:",
+    "ML transform failure:",
 )
 
 

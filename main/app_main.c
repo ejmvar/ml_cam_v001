@@ -10,6 +10,7 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "camera.h"
+#include "analysis.h"
 #include "http_server.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -115,10 +116,18 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
         char ip_address[16];
         esp_ip4addr_ntoa(&got_ip->ip_info.ip, ip_address, sizeof(ip_address));
+        esp_err_t err = ml_http_server_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "HTTP checkpoint server unavailable (%s)",
+                     esp_err_to_name(err));
+            return;
+        }
         ESP_LOGI(TAG, "Wi-Fi connected and IP acquired");
         ESP_LOGI(TAG, "Image checkpoint URL: http://%s/capture.jpg", ip_address);
-        if (ml_http_server_start() != ESP_OK) {
-            ESP_LOGE(TAG, "HTTP checkpoint server unavailable");
+        err = ml_camera_start_periodic();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Periodic capture is unavailable (%s); HTTP/fresh capture remains usable",
+                     esp_err_to_name(err));
         }
     }
 }
@@ -204,6 +213,10 @@ void app_main(void)
         }
     } else {
         ESP_LOGE(TAG, "Camera is unavailable; continuing without capture");
+    }
+
+    if (ml_analysis_init() != ESP_OK) {
+        ESP_LOGE(TAG, "RAM analysis window unavailable");
     }
 
     if (start_wifi_from_nvs() != ESP_OK) {
